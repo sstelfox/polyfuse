@@ -128,7 +128,7 @@ struct VacantEntry<'a> {
 }
 
 impl VacantEntry<'_> {
-    fn insert(mut self, inode: INode) {
+    fn insert(self, inode: INode) {
         let path = inode.path.clone();
         self.table.map.insert(self.ino, inode);
         self.table.path_to_ino.insert(path, self.ino);
@@ -151,7 +151,7 @@ impl PathThrough {
         inodes.vacant_entry().insert(INode {
             ino: 1,
             path: PathBuf::new(),
-            refcount: u64::max_value() / 2,
+            refcount: u64::MAX / 2,
         });
 
         Ok(Self {
@@ -195,7 +195,7 @@ impl PathThrough {
         for forget in forgets {
             if let Entry::Occupied(mut entry) = self.inodes.map.entry(forget.ino()) {
                 let refcount = {
-                    let mut inode = entry.get_mut();
+                    let inode = entry.get_mut();
                     inode.refcount = inode.refcount.saturating_sub(forget.nlookup());
                     inode.refcount
                 };
@@ -302,8 +302,13 @@ impl PathThrough {
             dir.offset += 1;
         }
 
-        while let Some(entry) = dir.read_dir.next() {
-            let entry = entry?;
+        loop {
+            let entry = match dir.read_dir.next() {
+                Some(Ok(e)) => e,
+                Some(Err(err)) => return Err(err),
+                None => break,
+            };
+
             match entry.file_name() {
                 name if name.as_bytes() == b"." || name.as_bytes() == b".." => continue,
                 _ => (),

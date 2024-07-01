@@ -1,10 +1,3 @@
-use crate::{
-    bytes::{Bytes, FillBytes},
-    conn::{Connection, MountOptions},
-    decoder::Decoder,
-    op::{DecodeError, Operation},
-};
-use polyfuse_kernel::*;
 use std::{
     cmp,
     convert::{TryFrom, TryInto as _},
@@ -19,7 +12,17 @@ use std::{
         Arc,
     },
 };
-use zerocopy::AsBytes as _;
+
+use zerocopy::AsBytes;
+
+use crate::{
+    bytes::{Bytes, FillBytes},
+    conn::{Connection, MountOptions},
+    decoder::Decoder,
+    op::{DecodeError, Operation},
+};
+
+use polyfuse_kernel::*;
 
 // The minimum supported ABI minor version by polyfuse.
 const MINIMUM_SUPPORTED_MINOR_VERSION: u32 = 23;
@@ -504,7 +507,7 @@ where
                     init_out.flags |= FUSE_MAX_PAGES;
                     init_out.max_pages = cmp::min(
                         (init_out.max_write - 1) / (pagesize() as u32) + 1,
-                        u16::max_value() as u32,
+                        u16::MAX as u32,
                     ) as u16;
                 }
 
@@ -1062,7 +1065,7 @@ where
                 vec.set_len(count);
             }
 
-            written = writer.write_vectored(&*vec)?;
+            written = writer.write_vectored(&vec)?;
         }
     }
 

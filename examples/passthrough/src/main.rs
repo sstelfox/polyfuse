@@ -1,5 +1,4 @@
-#![allow(clippy::unnecessary_mut_passed)]
-#![warn(clippy::unimplemented, clippy::todo)]
+#![feature(slice_take)]
 
 mod fs;
 
@@ -11,7 +10,6 @@ use polyfuse::{
     KernelConfig, Operation, Session,
 };
 
-use anyhow::{ensure, Context as _, Result};
 use either::Either;
 use pico_args::Arguments;
 use slab::Slab;
@@ -29,15 +27,19 @@ use std::{
 
 use crate::fs::{FileDesc, ReadDir};
 
-fn main() -> Result<()> {
+fn main() -> Result<(), String> {
     tracing_subscriber::fmt::init();
 
     let mut args = Arguments::from_env();
 
     let source: PathBuf = args
-        .opt_value_from_str(["-s", "--source"])?
+        .opt_value_from_str(["-s", "--source"])
+        .map_err(|e| e.to_string())?
         .unwrap_or_else(|| std::env::current_dir().unwrap());
-    ensure!(source.is_dir(), "the source path must be a directory");
+
+    if !source.is_dir() {
+        return Err("the source path must be a directory".into());
+    }
 
     let timeout = if args.contains("--no-cache") {
         None
@@ -45,30 +47,55 @@ fn main() -> Result<()> {
         Some(Duration::from_secs(60 * 60 * 24)) // one day
     };
 
-    let mountpoint: PathBuf = args.free_from_str()?.context("missing mountpoint")?;
-    ensure!(mountpoint.is_dir(), "mountpoint must be a directory");
+    let mountpoint: PathBuf = args
+        .free_from_str::<PathBuf>()
+        .map_err(|e| format!("missing mountpoint: {}", e))?;
+
+    if !mountpoint.is_dir() {
+        return Err("mountpoint must be a directory".into());
+    }
 
     // TODO: splice read/write
     let session = Session::mount(mountpoint, {
         let mut config = KernelConfig::default();
+
         config.mount_option("default_permissions");
         config.mount_option("fsname=passthrough");
         config.export_support(true);
         config.flock_locks(true);
         config.writeback_cache(timeout.is_some());
+
         config
-    })?;
+    })
+    .map_err(|e| format!("failed to mount: {}", e))?;
 
-    let fs = Arc::new(Passthrough::new(source, timeout)?);
+    let fs = match Passthrough::new(source, timeout) {
+        Ok(pt) => Arc::new(pt),
+        Err(err) => {
+            // does not exist, don't think its necessary
+            //session.unmount()?;
 
-    while let Some(req) = session.next_request()? {
+            return Err(format!(
+                "failed to create a passthrough filesystem: {}",
+                err
+            ));
+        }
+    };
+
+    loop {
+        let req = match session.next_request() {
+            Ok(Some(r)) => r,
+            Ok(None) => break,
+            Err(err) => return Err(err.to_string()),
+        };
+
         let fs = fs.clone();
 
-        std::thread::spawn(move || -> Result<()> {
+        std::thread::spawn(move || -> Result<(), String> {
             let span = tracing::debug_span!("handle_request", unique = req.unique());
             let _enter = span.enter();
 
-            let op = req.operation()?;
+            let op = req.operation().map_err(|e| e.to_string())?;
             tracing::debug!(?op);
 
             macro_rules! try_reply {
@@ -76,12 +103,12 @@ fn main() -> Result<()> {
                     match $e {
                         Ok(data) => {
                             tracing::debug!(?data);
-                            req.reply(data)?;
+                            req.reply(data).map_err(|e| e.to_string())?;
                         }
                         Err(err) => {
                             let errno = io_to_errno(err);
                             tracing::debug!(errno = errno);
-                            req.reply_error(errno)?;
+                            req.reply_error(errno).map_err(|e| e.to_string())?;
                         }
                     }
                 };
@@ -148,7 +175,7 @@ fn main() -> Result<()> {
 
                 Operation::Statfs(op) => try_reply!(fs.do_statfs(&op)),
 
-                _ => req.reply_error(libc::ENOSYS)?,
+                _ => req.reply_error(libc::ENOSYS).map_err(|e| e.to_string())?,
             }
 
             Ok(())
@@ -181,7 +208,7 @@ impl Passthrough {
         entry.insert(INode {
             ino: 1,
             fd,
-            refcount: u64::max_value() / 2, // the root node's cache is never removed.
+            refcount: u64::MAX / 2, // the root node's cache is never removed.
             src_id: (stat.st_ino, stat.st_dev),
             is_symlink: false,
         });
@@ -293,11 +320,7 @@ impl Passthrough {
         } else {
             None
         };
-        let mut file = if let Some(ref mut file) = file {
-            Some(file.lock().unwrap())
-        } else {
-            None
-        };
+        let mut file = file.as_mut().map(|file| file.lock().unwrap());
 
         // chmod
         if let Some(mode) = op.mode() {
@@ -565,7 +588,7 @@ impl Passthrough {
         }
         options.custom_flags(op.flags() as i32 & !libc::O_NOFOLLOW);
 
-        let file = options.open(&inode.fd.procname())?;
+        let file = options.open(inode.fd.procname())?;
         let fh = self.opened_files.insert(Mutex::new(file));
 
         let mut out = OpenOut::default();
@@ -592,8 +615,7 @@ impl Passthrough {
         T: BufRead + Unpin,
     {
         let file = self.opened_files.get(op.fh()).ok_or_else(no_entry)?;
-        let mut file = file.lock().unwrap();
-        let file = &mut *file;
+        let file = &mut *file.lock().unwrap();
 
         file.seek(io::SeekFrom::Start(op.offset()))?;
 
@@ -604,15 +626,14 @@ impl Passthrough {
         // In order to efficiently transfer the large files, both of zero
         // copying support in `polyfuse` and resolution of impedance mismatch
         // between `futures::io` and `tokio::io` are required.
-        let mut buf = Vec::with_capacity(op.size() as usize);
-        data.read_to_end(&mut buf)?;
+        let expected_size = op.size() as usize;
 
-        let mut buf = &buf[..];
-        let mut buf = (&mut buf).take(op.size() as u64);
-        let written = std::io::copy(&mut buf, &mut *file)?;
+        let mut buf = Vec::with_capacity(expected_size);
+        data.read_exact(&mut buf)?;
+        file.write_all(&buf)?;
 
         let mut out = WriteOut::default();
-        out.size(written as u32);
+        out.size(expected_size as u32);
 
         Ok(out)
     }

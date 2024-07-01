@@ -1,4 +1,4 @@
-use ctest::TestGenerator;
+use ctest2::TestGenerator;
 
 fn main() {
     generate_abi_tests();
@@ -6,6 +6,7 @@ fn main() {
 
 fn generate_abi_tests() {
     let mut cfg = TestGenerator::new();
+
     cfg.header("fuse_kernel.h");
     cfg.header("sys/ioctl.h");
     cfg.include("libfuse/include");
